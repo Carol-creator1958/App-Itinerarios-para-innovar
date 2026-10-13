@@ -629,6 +629,10 @@ input,textarea,select{font:inherit;color:inherit}
 #newPop .btn-save{position:sticky;bottom:0;box-shadow:0 8px 0 8px #fff;z-index:2}
 .cp-wheelbox{margin:0 auto}
 
+.live{cursor:pointer;border-radius:999px;padding:3px 6px;margin:-3px -6px}
+.live:hover{background:rgba(0,0,0,.05)}
+.live.backup .dot{background:#C9A227;animation:none}
+
 </style>
 </head>
 <body>
@@ -1650,6 +1654,7 @@ async function loadAll() {
   S.msgs = new Map((m.data || []).map(r => [r.id, r]));
   S.members = new Map((mem.data || []).map(r => [r.nombre, r]));
   S.entregas = en.data || [];
+  lastSync = nowISO(); lastFullSync = Date.now();
 }
 
 function touchMember() {
@@ -1658,31 +1663,113 @@ function touchMember() {
   return T('miembros').upsert(row, { onConflict: 'equipo,nombre' });
 }
 
+/* ---------- Conexión en vivo ----------
+   Canal 1 (presencia + movimientos en vivo) decide "EN VIVO / SIN RED".
+   Canal 2 (cambios de la base de datos). Si falla, la app consulta la base
+   cada pocos segundos como respaldo, así nadie se pierde el trabajo del equipo. */
+let dbChannel = null, dbHealthy = false, dbRetry = 0, dbRetryTimer = null, lastSync = null, lastFullSync = 0, syncBusy = false, syncTimer = null;
+const DIAG = { live: '', db: '', lastError: '', lastErrorAt: null, polls: 0 };
+function noteErr(where, status, err) {
+  const msg = (err && (err.message || err.reason || (typeof err === 'string' ? err : JSON.stringify(err)))) || status;
+  DIAG.lastError = `${where}: ${msg}`; DIAG.lastErrorAt = nowISO();
+  console.warn('[tiempo real]', where, status, err || '');
+}
 function subscribe() {
   if (channel) { try { sb.removeChannel(channel); } catch {} }
   const team = S.me.slug;
   channel = sb.channel('itin-' + team, { config: { presence: { key: clientId }, broadcast: { self: false } } });
-  const f = `equipo=eq.${team}`;
   channel
-    .on('postgres_changes', { event: '*', schema: 'public', table: CONFIG.t.notas, filter: f }, p => onNoteRow(p.new, p.eventType))
-    .on('postgres_changes', { event: '*', schema: 'public', table: CONFIG.t.mensajes, filter: f }, p => onMsgRow(p.new, p.eventType))
-    .on('postgres_changes', { event: '*', schema: 'public', table: CONFIG.t.miembros, filter: f }, p => onMemberRow(p.new))
-    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: CONFIG.t.entregas, filter: f }, p => onEntregaRow(p.new))
     .on('presence', { event: 'sync' }, onPresence)
     .on('broadcast', { event: 'move' }, ({ payload }) => onRemoteMove(payload))
     .on('broadcast', { event: 'cursor' }, ({ payload }) => onRemoteCursor(payload))
     .on('broadcast', { event: 'typing' }, ({ payload }) => onTyping(payload))
     .on('broadcast', { event: 'resize' }, ({ payload }) => onRemoteResize(payload))
-    .subscribe(async (status) => {
+    .subscribe(async (status, err) => {
+      DIAG.live = status;
       if (status === 'SUBSCRIBED') {
         const reconnect = S.wasLive && S.live !== 'on';
         setLive('on'); S.wasLive = true;
         trackNow();
-        if (reconnect) { try { await loadAll(); renderAll(); toast('Conexión recuperada · tablero actualizado'); } catch (e) { console.warn(e); } pump(); }
+        if (reconnect) { syncNow(true); pump(); toast('Conexión recuperada · tablero actualizado'); }
       } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        noteErr('conexión en vivo', status, err);
         setLive('off');
       }
     });
+  subscribeDb();
+  if (!syncTimer) syncTimer = setInterval(syncTick, 4000);
+}
+function subscribeDb() {
+  clearTimeout(dbRetryTimer);
+  if (dbChannel) { try { sb.removeChannel(dbChannel); } catch {} dbChannel = null; }
+  const team = S.me.slug, f = `equipo=eq.${team}`;
+  const ch = sb.channel('itin-db-' + team);
+  dbChannel = ch;
+  ch.on('postgres_changes', { event: '*', schema: 'public', table: CONFIG.t.notas, filter: f }, p => onNoteRow(p.new, p.eventType))
+    .on('postgres_changes', { event: '*', schema: 'public', table: CONFIG.t.mensajes, filter: f }, p => onMsgRow(p.new, p.eventType))
+    .on('postgres_changes', { event: '*', schema: 'public', table: CONFIG.t.miembros, filter: f }, p => onMemberRow(p.new))
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: CONFIG.t.entregas, filter: f }, p => onEntregaRow(p.new))
+    .subscribe((status, err) => {
+      if (ch !== dbChannel) return;               // canal viejo
+      DIAG.db = status;
+      if (status === 'SUBSCRIBED') {
+        const was = dbHealthy; dbHealthy = true; dbRetry = 0;
+        if (!was) syncNow(true);
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        dbHealthy = false;
+        noteErr('cambios de la base', status, err);
+        // Reintentar con calma; mientras tanto, la consulta de respaldo mantiene todo al día
+        const wait = Math.min(60000, 3000 * 2 ** dbRetry++);
+        try { sb.removeChannel(ch); } catch {}
+        if (ch === dbChannel) dbChannel = null;
+        dbRetryTimer = setTimeout(() => { if (S.me && !S.readonly) subscribeDb(); }, wait);
+      }
+      renderLiveTitle();
+    });
+}
+function syncTick() {
+  if (!S.me || S.readonly || document.visibilityState === 'hidden') return;
+  // Sin canal de la base: cada 4 s. Con canal sano: verificación ligera cada 30 s.
+  if (!dbHealthy || Date.now() - lastFullSync > 30000) syncNow();
+}
+async function syncNow(force) {
+  if (syncBusy || !sb || !S.me) return; syncBusy = true;
+  const team = S.me.slug, started = nowISO();
+  // 5 min de margen por si los relojes de los dispositivos no coinciden
+  const since = new Date((lastSync ? Date.parse(lastSync) : Date.now()) - 5 * 60000).toISOString();
+  try {
+    const [n, m, e, mem] = await Promise.all([
+      T('notas').select('*').eq('equipo', team).gt('actualizado_en', since),
+      T('mensajes').select('*').eq('equipo', team).gt('creado_en', since).order('creado_en', { ascending: true }),
+      T('entregas').select('id,equipo,entregado_por,mensaje,creado_en').eq('equipo', team).gt('creado_en', since),
+      T('miembros').select('*').eq('equipo', team).gt('ultima_conexion', since)
+    ]);
+    const err = n.error || m.error || e.error || mem.error; if (err) throw err;
+    (n.data || []).forEach(r => {
+      const cur = S.notes.get(r.id);
+      if (!cur) { if (!r.borrado) onNoteRow(r, 'INSERT'); return; }
+      if (cur._pending || S.dragging === r.id) return;
+      const changed = ['titulo', 'descripcion', 'color', 'x', 'y', 'z', 'w', 'h', 'borrado'].some(k => (cur[k] ?? null) !== (r[k] ?? null)) || JSON.stringify(cur.votos || []) !== JSON.stringify(r.votos || []) || JSON.stringify(cur.adjuntos || []) !== JSON.stringify(r.adjuntos || []);
+      if (changed) onNoteRow(r, 'UPDATE');
+    });
+    (m.data || []).forEach(r => { const cur = S.msgs.get(r.id); if (!cur || (!!cur.borrado !== !!r.borrado) || cur._pending) onMsgRow(r, 'INSERT'); });
+    (e.data || []).forEach(r => { if (!S.entregas.find(x => x.id === r.id)) onEntregaRow(r); });
+    (mem.data || []).forEach(onMemberRow);
+    lastSync = started; lastFullSync = Date.now(); DIAG.polls++;
+  } catch (ex) {
+    noteErr('consulta de respaldo', 'error', ex);
+  } finally { syncBusy = false; renderLiveTitle(); }
+}
+function renderLiveTitle() {
+  const el = $('#live'); if (!el || !S.me) return;
+  el.title = S.live === 'on'
+    ? (dbHealthy ? 'Conectado: ves los cambios del equipo al instante' : 'Conectado. Los cambios del equipo se revisan cada 4 segundos (modo respaldo).')
+    : S.live === 'off' ? 'Sin conexión en tiempo real. Reintentando… (toca para ver el detalle)' : 'Conectando…';
+  el.classList.toggle('backup', S.live === 'on' && !dbHealthy);
+}
+function showLiveDetail() {
+  const ok = (s) => s === 'SUBSCRIBED' ? '✅ conectado' : s ? '⚠️ ' + s : '…';
+  toast(`<b>Estado de la conexión</b><br>Internet del dispositivo: ${navigator.onLine ? '✅' : '❌ sin internet'}<br>En línea y movimientos: ${ok(DIAG.live)}<br>Cambios de la base: ${dbHealthy ? '✅ al instante' : '🔁 respaldo cada 4 s'}${DIAG.lastError ? `<br>Último aviso: ${esc(DIAG.lastError).slice(0, 160)} (${fmtTime(DIAG.lastErrorAt)})` : ''}`, { ms: 12000 });
 }
 
 function setLive(st) {
@@ -1690,10 +1777,10 @@ function setLive(st) {
   const el = $('#live'); if (!el) return;
   el.dataset.state = st;
   $('#liveTxt').textContent = st === 'on' ? 'EN VIVO' : st === 'off' ? 'SIN RED' : 'CONECTANDO';
-  el.title = st === 'on' ? 'Conectado: ves los cambios del equipo al instante' : st === 'off' ? 'Sin conexión en tiempo real. Reintentando…' : 'Conectando…';
+  renderLiveTitle();
   setSave();
 }
-window.addEventListener('online', () => { setSave(); pump(); });
+window.addEventListener('online', () => { setSave(); pump(); syncNow(true); });
 window.addEventListener('offline', () => { setLive('off'); setSave(); });
 
 /* ---------- Presencia ---------- */
@@ -3030,6 +3117,7 @@ function bindUI() {
   $('#toolStrip').addEventListener('click', e => { const b = e.target.closest('[data-key]'); if (b) goBoard(b.dataset.key); });
   $('#avatars').addEventListener('click', e => { const a = e.target.closest('[data-board]'); if (a && a.dataset.board && a.dataset.name !== S.me.name) { goBoard(a.dataset.board); toast(`Estás con ${esc(firstName(a.dataset.name))} en ${esc(boardLabel(a.dataset.board))}`); } });
   $('#save').onclick = () => { if (qErr) { qErr = false; pump(); } };
+  $('#live').addEventListener('click', showLiveDetail);
   $('#btnGuide').onclick = () => openGuide();
   $('#btnUndo').onclick = undo; $('#btnRedo').onclick = redo;
   $('#btnNew').onclick = () => $('#newPop').hidden ? openNewPop() : closeNewPop();
@@ -3130,7 +3218,7 @@ function bindUI() {
     const pop = $('#newPop');
     if (!pop.hidden && !pop.contains(e.target) && !e.target.closest('#btnNew') && !e.target.closest('.modal-root')) closeNewPop();
   });
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S.me && !S.readonly) { trackNow(); renderEditing(); } });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S.me && !S.readonly) { trackNow(); renderEditing(); syncNow(true); } });
   bindBoard();
   ro.observe($('#boardWrap'));
 }
