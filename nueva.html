@@ -624,6 +624,11 @@ input,textarea,select{font:inherit;color:inherit}
 #aiSend:disabled{opacity:.5}
 @media (max-width:980px){.ai-btn{padding:6px 11px;font-size:14px}}
 
+/* panel "+ Nuevo elemento": deslizable cuando no cabe en la pantalla */
+.popover{max-height:calc(100vh - 16px);max-height:calc(100dvh - 16px);overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+#newPop .btn-save{position:sticky;bottom:0;box-shadow:0 8px 0 8px #fff;z-index:2}
+.cp-wheelbox{margin:0 auto}
+
 </style>
 </head>
 <body>
@@ -2309,15 +2314,21 @@ function openNewPop(pos, cx, cy) {
   S.newPos = pos || null;
   $('#nfTitle').value = ''; $('#nfDesc').value = ''; $('#nfFiles').value = ''; $('#nfFilesTxt').textContent = `Opcional · máx. ${CONFIG.maxFileMB} MB c/u`;
   colorPicker($('#nfColors'), S.newColor, c => { S.newColor = c; });
-  pop.hidden = false;
-  const pw = pop.offsetWidth, ph = pop.offsetHeight;
+  pop.hidden = false; pop.scrollTop = 0;
+  const pw = pop.offsetWidth;
   let left, top;
   if (cx != null) { left = cx + 12; top = cy - 20; }
   else { const r = $('#btnNew').getBoundingClientRect(); left = r.right - pw + 20; top = r.top - 8; }
   pop.style.left = clamp(left, 8, innerWidth - pw - 8) + 'px';
-  pop.style.top = clamp(top, 8, innerHeight - ph - 8) + 'px';
+  pop._top = top; placeNewPop();
   setTimeout(() => $('#nfTitle').focus(), 30);
   setEditing('nuevo post-it');
+}
+// Mantiene el panel dentro de la pantalla; si no cabe, se puede deslizar (scroll)
+function placeNewPop() {
+  const pop = $('#newPop'); if (pop.hidden) return;
+  const ph = Math.min(pop.scrollHeight, innerHeight - 16);
+  pop.style.top = clamp(pop._top ?? 8, 8, innerHeight - ph - 8) + 'px';
 }
 function closeNewPop() { if (!$('#newPop').hidden) { $('#newPop').hidden = true; if (S.editing === 'nuevo post-it') setEditing(null); } }
 function freeSpot() {
@@ -3022,6 +3033,8 @@ function bindUI() {
   $('#btnUndo').onclick = undo; $('#btnRedo').onclick = redo;
   $('#btnNew').onclick = () => $('#newPop').hidden ? openNewPop() : closeNewPop();
   $('#newPopClose').onclick = closeNewPop;
+  $('#newPop').addEventListener('toggle', e => { placeNewPop(); if (e.target.open) setTimeout(() => e.target.scrollIntoView({ block: 'nearest', behavior: 'smooth' }), 30); }, true);
+  window.addEventListener('resize', placeNewPop);
   $('#nfFiles').onchange = e => { const f = [...e.target.files]; $('#nfFilesTxt').textContent = f.length ? f.map(x => x.name).join(', ') : `Opcional · máx. ${CONFIG.maxFileMB} MB c/u`; };
   $('#newForm').addEventListener('submit', e => {
     e.preventDefault();
