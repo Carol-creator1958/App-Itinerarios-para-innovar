@@ -212,7 +212,7 @@ input,textarea,select{font:inherit;color:inherit}
 /* Post-its */
 .note{position:absolute;width:168px;min-height:128px;max-height:220px;padding:12px 12px 8px;box-shadow:0 2px 3px rgba(0,0,0,.12),0 8px 18px rgba(0,0,0,.10);cursor:grab;display:flex;flex-direction:column;gap:4px;touch-action:none;transition:box-shadow .15s, transform .15s, left .12s linear, top .12s linear;outline:3px solid transparent;outline-offset:2px}
 .note.dragging{cursor:grabbing;transition:none;transform:rotate(-2deg) scale(1.04);box-shadow:0 18px 36px rgba(0,0,0,.25);z-index:99999!important}
-.note.remote-drag{transition:left .08s linear, top .08s linear}
+.note.remote-drag{transition:left .2s linear, top .2s linear}
 .board.readonly .note{cursor:pointer}
 .note:hover{box-shadow:0 3px 6px rgba(0,0,0,.14),0 12px 24px rgba(0,0,0,.14)}
 .note .n-title{font-weight:700;font-size:15px;line-height:1.2;word-break:break-word;color:#1d1d1b}
@@ -225,7 +225,7 @@ input,textarea,select{font:inherit;color:inherit}
 @keyframes flash{50%{outline-color:#1d1d1b}}
 .note.new-in{animation:popIn .35s cubic-bezier(.2,1.4,.5,1)}
 @keyframes popIn{from{transform:scale(.6);opacity:0}to{transform:none;opacity:1}}
-.cursor{position:absolute;pointer-events:none;z-index:100000;transition:left .1s linear, top .1s linear}
+.cursor{position:absolute;pointer-events:none;z-index:100000;transition:left .25s linear, top .25s linear}
 .cursor svg{width:22px;height:22px;display:block;filter:drop-shadow(0 1px 1px rgba(0,0,0,.3))}
 .cursor span{position:absolute;left:16px;top:16px;font-size:12px;font-weight:700;color:#fff;padding:2px 7px;border-radius:6px;white-space:nowrap}
 
@@ -1620,7 +1620,7 @@ function initClient() {
   }
   sb = window.supabase.createClient(CONFIG.url, CONFIG.key, {
     auth: { persistSession: false, autoRefreshToken: false },
-    realtime: { params: { eventsPerSecond: 30 } }
+    realtime: { params: { eventsPerSecond: 15 } }
   });
   return true;
 }
@@ -1674,30 +1674,40 @@ function noteErr(where, status, err) {
   DIAG.lastError = `${where}: ${msg}`; DIAG.lastErrorAt = nowISO();
   console.warn('[tiempo real]', where, status, err || '');
 }
+let liveRetry = 0, liveRetryTimer = null;
 function subscribe() {
-  if (channel) { try { sb.removeChannel(channel); } catch {} }
+  if (!syncTimer) syncTimer = setInterval(syncTick, 4000);
+  subscribeLive();
+  subscribeDb();
+}
+function subscribeLive() {
+  clearTimeout(liveRetryTimer);
+  if (channel) { const old = channel; channel = null; try { sb.removeChannel(old); } catch {} }
   const team = S.me.slug;
-  channel = sb.channel('itin-' + team, { config: { presence: { key: clientId }, broadcast: { self: false } } });
-  channel
-    .on('presence', { event: 'sync' }, onPresence)
+  const ch = sb.channel('itin-' + team, { config: { presence: { key: clientId }, broadcast: { self: false } } });
+  channel = ch;
+  ch.on('presence', { event: 'sync' }, () => { if (ch === channel) onPresence(); })
     .on('broadcast', { event: 'move' }, ({ payload }) => onRemoteMove(payload))
     .on('broadcast', { event: 'cursor' }, ({ payload }) => onRemoteCursor(payload))
     .on('broadcast', { event: 'typing' }, ({ payload }) => onTyping(payload))
     .on('broadcast', { event: 'resize' }, ({ payload }) => onRemoteResize(payload))
     .subscribe(async (status, err) => {
+      if (ch !== channel) return;                 // canal viejo, ignorar
       DIAG.live = status;
       if (status === 'SUBSCRIBED') {
         const reconnect = S.wasLive && S.live !== 'on';
+        liveRetry = 0;
         setLive('on'); S.wasLive = true;
         trackNow();
-        if (reconnect) { syncNow(true); pump(); toast('Conexión recuperada · tablero actualizado'); }
+        if (reconnect) { syncNow(true); pump(); toast('Conexión en vivo recuperada'); }
       } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
         noteErr('conexión en vivo', status, err);
         setLive('off');
+        // Reconectar sola: 2 s, 4 s, 8 s… hasta 30 s
+        const wait = Math.min(30000, 2000 * 2 ** liveRetry++);
+        liveRetryTimer = setTimeout(() => { if (S.me && !S.readonly && ch === channel) subscribeLive(); }, wait);
       }
     });
-  subscribeDb();
-  if (!syncTimer) syncTimer = setInterval(syncTick, 4000);
 }
 function subscribeDb() {
   clearTimeout(dbRetryTimer);
@@ -1787,7 +1797,7 @@ window.addEventListener('offline', () => { setLive('off'); setSave(); });
 function presencePayload() {
   return { cid: clientId, nombre: S.me.name, color: S.me.color, tablero: S.board, area: S.area, editando: S.editing, desde: S._since || (S._since = nowISO()) };
 }
-const trackNow = debounce(() => { if (channel && S.live === 'on') channel.track(presencePayload()).catch(() => {}); }, 150);
+const trackNow = debounce(() => { if (channel && S.live === 'on' && channel.state === 'joined') channel.track(presencePayload()).catch(() => {}); }, 400);
 function setEditing(v) { if (S.editing === v) return; S.editing = v; trackNow(); renderEditing(); }
 
 function onPresence() {
@@ -2077,9 +2087,12 @@ function toBoard(e) {
 }
 
 /* ---------- Gestos sobre el tablero: mover, tamaño, menú, zoom táctil ---------- */
-const sendMove = throttle((p) => channel && channel.send({ type: 'broadcast', event: 'move', payload: p }), 45);
-const sendResize = throttle((p) => channel && channel.send({ type: 'broadcast', event: 'resize', payload: p }), 60);
-const sendCursor = throttle((p) => channel && channel.send({ type: 'broadcast', event: 'cursor', payload: p }), 70);
+// Mensajes en vivo, con moderación: el plan gratuito de Supabase desconecta si el proyecto
+// envía demasiados mensajes por segundo. Solo se envían si la conexión en vivo está activa.
+const liveSend = (event, payload) => { if (channel && S.live === 'on' && channel.state === 'joined') channel.send({ type: 'broadcast', event, payload }).catch(() => {}); };
+const sendMove = throttle((p) => liveSend('move', p), 180);
+const sendResize = throttle((p) => liveSend('resize', p), 200);
+const sendCursor = throttle((p) => { if (!S.dragging) liveSend('cursor', p); }, 250);
 
 function bindBoard() {
   const board = $('#board'), wrap = $('#boardWrap');
@@ -2868,7 +2881,7 @@ function sendMsg(tipo, fields) {
     const c = S.msgs.get(m.id); if (c) c._pending = false; tipo === 'chat' ? renderChat() : renderBlog();
   }).catch(() => {});
 }
-const sendTyping = throttle(() => channel && channel.send({ type: 'broadcast', event: 'typing', payload: { name: S.me.name } }), 1500);
+const sendTyping = throttle(() => liveSend('typing', { name: S.me.name }), 2500);
 
 /* ---------- Blog ---------- */
 const openComments = new Set();
